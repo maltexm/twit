@@ -13,7 +13,7 @@ use std::io::{self, Write};
 
 use crate::config::Config;
 use crate::tui::App;
-use crate::twitter::TwitterClient;
+use crate::twitter::{OAuthApp, TwitterClient, login};
 
 #[derive(Parser)]
 #[command(name = "twit")]
@@ -29,7 +29,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Configure Twitter authentication (cookie-based)
+    /// Authorize twit with your X account (OAuth 2.0)
     Auth,
     /// Debug: dump raw API response to file
     Debug,
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Some(Commands::Auth) => run_auth_wizard().await,
+        Some(Commands::Auth) => run_auth().await,
         Some(Commands::Debug) => run_debug().await,
         Some(Commands::Config { command }) => match command {
             ConfigCommands::Verify => run_config_verify(),
@@ -101,77 +101,21 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_auth_wizard() -> Result<()> {
-    println!("🐦 Twitter Authentication Setup");
-    println!("================================\n");
-
-    println!("To authenticate, you need to get cookies from your browser.\n");
-    println!("Steps:");
-    println!("  1. Open https://x.com in Chrome/Brave/Firefox");
-    println!("  2. Log in to your account");
-    println!("  3. Open DevTools (F12 or Cmd+Option+I)");
-    println!("  4. Go to Application → Cookies → https://x.com");
-    println!("  5. Find and copy the values for:");
-    println!("     - auth_token");
-    println!("     - ct0\n");
-
-    // Prompt for auth_token
-    print!("Enter auth_token: ");
-    io::stdout().flush()?;
-    let mut auth_token = String::new();
-    io::stdin().read_line(&mut auth_token)?;
-    let auth_token = auth_token.trim().to_string();
-
-    if auth_token.is_empty() {
-        anyhow::bail!("auth_token cannot be empty");
-    }
-
-    // Prompt for ct0
-    print!("Enter ct0: ");
-    io::stdout().flush()?;
-    let mut ct0 = String::new();
-    io::stdin().read_line(&mut ct0)?;
-    let ct0 = ct0.trim().to_string();
-
-    if ct0.is_empty() {
-        anyhow::bail!("ct0 cannot be empty");
-    }
-
-    println!("\nValidating credentials...");
-
-    // Test the credentials
-    let client = TwitterClient::new(auth_token.clone(), ct0.clone())
-        .context("Failed to create Twitter client")?;
-
-    match client.get_home_timeline(1).await {
-        Ok(tweets) => {
-            println!("✓ Authentication successful!");
-            if let Some(tweet) = tweets.first() {
-                println!("  Found {} tweets in timeline", tweets.len());
-                println!("  Latest from: @{}", tweet.user.screen_name);
-            }
-
-            // Save config
-            let config = Config {
-                auth_token,
-                ct0,
-                ..Config::default()
-            };
-            config.save().context("Failed to save config")?;
-
-            println!(
-                "\n✓ Configuration saved to: {}",
-                Config::config_path().display()
-            );
-            println!("\nYou can now run `twit` to view your timeline!");
-        }
-        Err(e) => {
-            println!("✗ Authentication failed: {:#}", e);
-            println!("\nPlease check your cookie values and try again.");
-            return Err(e);
-        }
-    }
-
+async fn run_auth() -> Result<()> {
+    let config = Config::load().with_context(|| {
+        format!(
+            "Set client_id (and optionally client_secret) in {} first; see README.",
+            Config::config_path().display()
+        )
+    })?;
+    let username = login(OAuthApp {
+        client_id: config.client_id,
+        client_secret: config.client_secret,
+        redirect_uri: config.redirect_uri,
+    })
+    .await?;
+    println!("\n✓ Authenticated as @{username}");
+    println!("You can now run `twit` to view your timeline!");
     Ok(())
 }
 
@@ -198,7 +142,7 @@ async fn run_debug() -> Result<()> {
         return Ok(());
     }
 
-    let client = TwitterClient::new(config.auth_token, config.ct0)?;
+    let client = TwitterClient::new(config.client_id, config.client_secret, config.redirect_uri)?;
 
     println!("\nFetching raw timeline response...");
     let raw = client.get_home_timeline_raw(5).await?;
@@ -279,7 +223,7 @@ async fn run_follow_user(username: &str, dry_run: bool, yes: bool) -> Result<()>
         logging::enable_debug();
     }
 
-    let client = TwitterClient::new(config.auth_token, config.ct0)?;
+    let client = TwitterClient::new(config.client_id, config.client_secret, config.redirect_uri)?;
 
     let username = username.trim();
     let username = username.trim_start_matches('@');
@@ -335,7 +279,7 @@ async fn run_clone_follows(
         logging::enable_debug();
     }
 
-    let client = TwitterClient::new(config.auth_token, config.ct0)?;
+    let client = TwitterClient::new(config.client_id, config.client_secret, config.redirect_uri)?;
 
     // Remove @ if present
     let username = username.trim_start_matches('@');
@@ -391,13 +335,8 @@ async fn run_clone_follows(
 
     println!("\nFound {} accounts to follow.", all_users.len());
 
-    // Filter out accounts we already follow
-    let to_follow: Vec<_> = all_users.iter().filter(|u| !u.following).collect();
-    let already_following = all_users.len() - to_follow.len();
-
-    if already_following > 0 {
-        println!("Already following {} of them.", already_following);
-    }
+    // The v2 API does not say whether we already follow them; re-following is a no-op.
+    let to_follow: Vec<_> = all_users.iter().collect();
 
     if to_follow.is_empty() {
         println!("Nothing new to follow!");

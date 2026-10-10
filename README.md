@@ -18,10 +18,10 @@
 
 ## Requirements and constraints
 
-- 2FA must be disabled for the account you use with this tool.
+twit uses the official X API v2 with OAuth 2.0 (user context). You need a developer app and API credits.
 
 > [!WARNING]  
-> This may violate Twitter/X ToS. Use a fresh burner account and do NOT reuse your primary account.
+> The X API is pay-per-use: reads cost about $0.005 per post, deduplicated per UTC day. Every timeline refresh bills the posts it returns, so twit defaults to `refresh_secs: 900` and `tweet_count: 20`. Raise them with care.
 
 > [!TIP]  
 > For the best experience, we recommend using Ghostty  
@@ -69,21 +69,14 @@ cargo zigbuild --release --target x86_64-unknown-linux-gnu --no-default-features
 Note: `--no-default-features` disables audio playback (ALSA) for cross builds. Use a Linux build environment or `cross` if you need audio enabled.
 
 
-## Auth cookies (auth_token + ct0)
+## Authentication (OAuth 2.0)
 
-You must extract cookies from an active X session in your browser.
+1. Create an app in the [X developer console](https://console.x.com) and make sure your account has API credits.
+2. Enable **OAuth 2.0 user authentication**, set the app type to *Web App* or *Native App*, and add the callback URL `http://127.0.0.1:8765/callback`.
+3. Put the app's `client_id` (and `client_secret` for a Web App/confidential client) in `~/.config/twit/config.yaml` (see `config.yml.example`). `redirect_uri` defaults to `http://127.0.0.1:8765/callback` and must match the console exactly.
+4. Run `twit auth`. It prints an authorization URL, tries to open it in your browser, and catches the redirect on the local callback port.
 
-Firefox:
-1. Log in to X.
-2. Open DevTools → Storage → Cookies → `https://x.com`.
-3. Copy the `auth_token` and `ct0` cookie values.
-
-Chrome:
-1. Log in to X.
-2. Open DevTools → Application → Cookies → `https://x.com`.
-3. Copy the `auth_token` and `ct0` cookie values.
-
-Put these values in `config.yaml` (see `config.yml.example`).
+Tokens are stored in `~/.config/twit/token.json` (mode 0600) and refreshed automatically. If refresh fails, run `twit auth` again.
 
 ## Power features (AI + TTS)
 

@@ -12,11 +12,12 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 ratatui-image = { version = "10", default-features = false, features = ["crossterm", "image-defaults"] }
 crossterm = "0.29"
 
-# Twitter auth (generates X-Client-Transaction-Id)
-x-client-transaction = { version = "0.1", default-features = false }
+# HTTP
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 
-# HTTP (pinned to 0.12 for x-client-transaction compatibility)
-reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "blocking", "rustls-tls-webpki-roots"] }
+# OAuth 2.0 PKCE
+sha2 = "0.10"
+rand = "0.9"
 
 # Async
 tokio = { version = "1", features = ["full"] }

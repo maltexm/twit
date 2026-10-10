@@ -1,7 +1,8 @@
-auth_token: "YOUR_AUTH_TOKEN"
-ct0: "YOUR_CT0"
-refresh_secs: 300
-tweet_count: 50
+client_id: "YOUR_OAUTH2_CLIENT_ID"  # from console.x.com (OAuth 2.0 user auth enabled)
+# client_secret: "YOUR_CLIENT_SECRET"  # optional; set for Web App (confidential) clients
+redirect_uri: "http://127.0.0.1:8765/callback"  # must match the callback registered in the X app
+refresh_secs: 900  # reads cost ~$0.005 per post; keep this and tweet_count modest
+tweet_count: 20
 show_images: true
 media_prefetch: all  # all | visible | nearby (for low-resource machines)
 image_cache_max_mb: 200  # LRU disk cache size limit

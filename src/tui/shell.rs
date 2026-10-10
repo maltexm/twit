@@ -27,8 +27,11 @@ pub struct Shell {
 
 impl Shell {
     pub async fn new(mut config: Config) -> Result<(Self, ShellBootstrap)> {
-        let client =
-            TwitterClient::new(config.auth_token.clone(), config.ct0.clone())?;
+        let client = TwitterClient::new(
+            config.client_id.clone(),
+            config.client_secret.clone(),
+            config.redirect_uri.clone(),
+        )?;
         let cache = TweetCache::open()?;
 
         let tweets = cache.get_tweets().unwrap_or_default();

@@ -9,10 +9,15 @@ use crate::ai::tts::catalog as tts_catalog;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Twitter auth_token cookie
-    pub auth_token: String,
-    /// Twitter ct0 (CSRF) cookie
-    pub ct0: String,
+    /// X OAuth 2.0 client ID (from console.x.com)
+    #[serde(default)]
+    pub client_id: String,
+    /// X OAuth 2.0 client secret (optional; set for confidential clients)
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// OAuth redirect URI; must match the callback registered in the X app
+    #[serde(default = "default_redirect_uri")]
+    pub redirect_uri: String,
     /// Auto-refresh interval in seconds (0 to disable)
     #[serde(default = "default_refresh_secs")]
     pub refresh_secs: u64,
@@ -85,10 +90,13 @@ impl ConfigValidation {
 }
 
 fn default_refresh_secs() -> u64 {
-    300 // 5 minutes
+    900 // 15 minutes; reads are billed per post
+}
+fn default_redirect_uri() -> String {
+    "http://127.0.0.1:8765/callback".to_string()
 }
 fn default_tweet_count() -> usize {
-    50
+    20
 }
 fn default_show_images() -> bool {
     true
@@ -168,8 +176,9 @@ fn default_tts_auto_speak() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            auth_token: String::new(),
-            ct0: String::new(),
+            client_id: String::new(),
+            client_secret: None,
+            redirect_uri: default_redirect_uri(),
             refresh_secs: default_refresh_secs(),
             tweet_count: default_tweet_count(),
             show_images: default_show_images(),
@@ -392,6 +401,11 @@ impl Config {
             .unwrap_or_else(|_| PathBuf::from("config.yaml"))
     }
 
+    /// Get the OAuth token file path (next to config.yaml)
+    pub fn token_path() -> PathBuf {
+        Self::config_path().with_file_name("token.json")
+    }
+
     /// Get the cache directory (~/.cache/twit on Linux)
     pub fn cache_dir() -> PathBuf {
         Self::project_dirs()
@@ -415,8 +429,8 @@ impl Config {
         let provider = config.ai.provider.clone();
         config.ai.model = normalize_ai_model(provider, &config.ai.model);
 
-        if config.auth_token.is_empty() || config.ct0.is_empty() {
-            anyhow::bail!("Config is missing auth_token or ct0");
+        if config.client_id.trim().is_empty() {
+            anyhow::bail!("Config is missing client_id");
         }
 
         Ok(config)
@@ -425,11 +439,8 @@ impl Config {
     pub fn validate(&self) -> ConfigValidation {
         let mut report = ConfigValidation::default();
 
-        if self.auth_token.trim().is_empty() {
-            report.errors.push("auth_token is missing".to_string());
-        }
-        if self.ct0.trim().is_empty() {
-            report.errors.push("ct0 is missing".to_string());
+        if self.client_id.trim().is_empty() {
+            report.errors.push("client_id is missing".to_string());
         }
         if self.tweet_count == 0 {
             report
@@ -594,24 +605,6 @@ impl Config {
         }
 
         report
-    }
-
-    /// Save config to disk
-    pub fn save(&self) -> Result<()> {
-        let path = Self::config_path();
-
-        // Create parent directories if needed
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create config directory: {}", parent.display())
-            })?;
-        }
-
-        let contents = serde_yaml::to_string(self).context("Failed to serialize config")?;
-        fs::write(&path, contents)
-            .with_context(|| format!("Failed to write config to {}", path.display()))?;
-
-        Ok(())
     }
 }
 

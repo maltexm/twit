@@ -1,132 +1,28 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
-use reqwest::header::{AUTHORIZATION, COOKIE, HeaderMap, HeaderValue};
+use chrono::{DateTime, Local, Utc};
+use reqwest::Method;
 use serde_json::Value;
-use x_client_transaction::ClientTransaction;
+use tokio::sync::Mutex;
 
 use crate::logging;
-use crate::twitter::types::{Media, MediaType, Tweet, User};
+use crate::twitter::auth::{self, OAuthApp, Token};
+use crate::twitter::types::{Media, MediaType, Tweet, UrlEntity, User};
 
-/// Extension trait for extracting values from JSON with fallbacks
-trait ValueExt {
-    fn str_at(&self, key: &str) -> &str;
-    fn u64_at(&self, key: &str) -> u64;
-    fn bool_at(&self, key: &str) -> bool;
-}
-
-impl ValueExt for Value {
-    fn str_at(&self, key: &str) -> &str {
-        self.get(key).and_then(|v| v.as_str()).unwrap_or("")
-    }
-
-    fn u64_at(&self, key: &str) -> u64 {
-        self.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
-    }
-
-    fn bool_at(&self, key: &str) -> bool {
-        self.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
-    }
-}
-
-/// Twitter's public web application bearer token.
-/// This is NOT a secret - it's the same token used by all browser-based Twitter/X clients.
-/// It identifies requests as coming from the official web app and is required for API access.
-/// This token is publicly documented and can be found in Twitter's web client JavaScript.
-const BEARER_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
-
-// HomeLatestTimeline = Following (chronological) feed
-// HomeTimeline = For You (algorithmic) feed
-const HOME_TIMELINE_PATH: &str = "/i/api/graphql/zCOPiWiP4fZS_547OU4yHA/HomeLatestTimeline";
-// User lookup by screen name
-const USER_BY_SCREEN_NAME_PATH: &str = "/i/api/graphql/xmU6X_CKVnQ5lSrCbAmJsg/UserByScreenName";
-// Get user's following list
-const FOLLOWING_PATH: &str = "/i/api/graphql/eWTmcJY3EMh-dxIR7CYTKw/Following";
-// Follow a user
-const CREATE_FRIENDSHIP_PATH: &str = "/i/api/1.1/friendships/create.json";
-// Current Chrome on macOS - update periodically to stay current
+/// Browser user agent for fetching images from pbs.twimg.com (not used for the API).
 pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-fn build_timeline_variables(count: usize, cursor: Option<&str>) -> Value {
-    let mut vars = serde_json::json!({
-        "count": count,
-        "includePromotedContent": false,
-        "latestControlAvailable": true,
-        "requestContext": "launch",
-        "withCommunity": true
-    });
-
-    if let Some(cursor) = cursor {
-        vars["cursor"] = Value::String(cursor.to_string());
-    }
-
-    vars
-}
-
-fn build_timeline_features() -> Value {
-    serde_json::json!({
-        "rweb_tipjar_consumption_enabled": true,
-        "responsive_web_graphql_exclude_directive_enabled": true,
-        "verified_phone_label_enabled": false,
-        "creator_subscriptions_tweet_preview_api_enabled": true,
-        "responsive_web_graphql_timeline_navigation_enabled": true,
-        "responsive_web_graphql_skip_user_profile_image_extensions_enabled": false,
-        "communities_web_enable_tweet_community_results_fetch": true,
-        "c9s_tweet_anatomy_moderator_badge_enabled": true,
-        "articles_preview_enabled": true,
-        "responsive_web_edit_tweet_api_enabled": true,
-        "graphql_is_translatable_rweb_tweet_is_translatable_enabled": true,
-        "view_counts_everywhere_api_enabled": true,
-        "longform_notetweets_consumption_enabled": true,
-        "responsive_web_twitter_article_tweet_consumption_enabled": true,
-        "tweet_awards_web_tipping_enabled": false,
-        "creator_subscriptions_quote_tweet_preview_enabled": false,
-        "freedom_of_speech_not_reach_fetch_enabled": true,
-        "standardized_nudges_misinfo": true,
-        "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": true,
-        "rweb_video_timestamps_enabled": true,
-        "longform_notetweets_rich_text_read_enabled": true,
-        "longform_notetweets_inline_media_enabled": true,
-        "responsive_web_enhance_cards_enabled": false,
-        "blue_business_profile_image_shape_enabled": false,
-        "responsive_web_text_conversations_enabled": false,
-        "vibe_api_enabled": false,
-        "tweetypie_unmention_optimization_enabled": false,
-        "interactive_text_enabled": false,
-        "responsive_web_grok_annotations_enabled": false,
-        "responsive_web_profile_redirect_enabled": false,
-        "responsive_web_jetfuel_frame": false,
-        "responsive_web_grok_imagine_annotation_enabled": false,
-        "profile_label_improvements_pcf_label_in_post_enabled": false,
-        "premium_content_api_read_enabled": false,
-        "responsive_web_grok_show_grok_translated_post": false,
-        "responsive_web_grok_share_attachment_enabled": false,
-        "post_ctas_fetch_enabled": false,
-        "responsive_web_grok_image_annotation_enabled": false,
-        "responsive_web_grok_analyze_post_followups_enabled": false,
-        "responsive_web_grok_analyze_button_fetch_trends_enabled": false,
-        "responsive_web_grok_community_note_auto_translation_is_enabled": false,
-        "rweb_video_screen_enabled": false,
-        "responsive_web_grok_analysis_button_from_backend": false
-    })
-}
-
-fn build_timeline_url(count: usize, cursor: Option<&str>) -> String {
-    let variables = build_timeline_variables(count, cursor);
-    let features = build_timeline_features();
-    format!(
-        "https://x.com{}?variables={}&features={}",
-        HOME_TIMELINE_PATH,
-        urlencoding::encode(&variables.to_string()),
-        urlencoding::encode(&features.to_string())
-    )
-}
+const API_BASE: &str = "https://api.x.com";
+const TWEET_FIELDS: &str = "created_at,public_metrics,conversation_id,in_reply_to_user_id,lang,entities,referenced_tweets,attachments,note_tweet,author_id";
+const EXPANSIONS: &str = "author_id,attachments.media_keys,referenced_tweets.id,referenced_tweets.id.author_id,in_reply_to_user_id";
+const USER_FIELDS: &str = "name,username,profile_image_url,verified,verified_type";
+const MEDIA_FIELDS: &str = "type,url,preview_image_url,width,height,variants";
 
 pub struct TwitterClient {
     http: reqwest::Client,
-    #[allow(dead_code)]
-    auth_token: String,
-    #[allow(dead_code)]
-    ct0: String,
+    app: OAuthApp,
+    token: Mutex<Token>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,111 +31,176 @@ pub struct TimelinePage {
     pub next_cursor: Option<String>,
 }
 
+/// A user from the following list
+#[derive(Debug, Clone)]
+pub struct FollowingUser {
+    pub id: String,
+    pub screen_name: String,
+    pub name: String,
+}
+
+/// A page of following results
+#[derive(Debug)]
+pub struct FollowingPage {
+    pub users: Vec<FollowingUser>,
+    pub next_cursor: Option<String>,
+}
+
+fn build_http() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent(concat!("twit/", env!("CARGO_PKG_VERSION")))
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .https_only(true)
+        .build()?)
+}
+
+/// Run the OAuth browser flow, look up the user, persist token.json; returns the @username.
+pub async fn login(app: OAuthApp) -> Result<String> {
+    let http = build_http()?;
+    let token = auth::authorize(&http, &app).await?;
+    let client = TwitterClient {
+        http,
+        app,
+        token: Mutex::new(token),
+    };
+    let me = client
+        .request(Method::GET, "/2/users/me", &[], None)
+        .await?;
+    let data = me.get("data").context("users/me returned no data")?;
+    let mut token = client.token.lock().await;
+    token.user_id = str_at(data, "id").to_string();
+    token.username = str_at(data, "username").to_string();
+    token.save()?;
+    Ok(token.username.clone())
+}
+
 impl TwitterClient {
-    pub fn new(auth_token: String, ct0: String) -> Result<Self> {
-        let mut headers = HeaderMap::new();
-        headers.insert("authority", HeaderValue::from_static("x.com"));
-        headers.insert("accept", HeaderValue::from_static("*/*"));
-        headers.insert(
-            "accept-language",
-            HeaderValue::from_static("en-US,en;q=0.9"),
-        );
-        headers.insert("cache-control", HeaderValue::from_static("no-cache"));
-        headers.insert("pragma", HeaderValue::from_static("no-cache"));
-        headers.insert("referer", HeaderValue::from_static("https://x.com/home"));
-        headers.insert("sec-fetch-dest", HeaderValue::from_static("empty"));
-        headers.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
-        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
-        headers.insert("x-twitter-active-user", HeaderValue::from_static("yes"));
-        headers.insert(
-            "x-twitter-auth-type",
-            HeaderValue::from_static("OAuth2Session"),
-        );
-        headers.insert("x-twitter-client-language", HeaderValue::from_static("en"));
-
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", BEARER_TOKEN))?,
-        );
-        headers.insert("x-csrf-token", HeaderValue::from_str(&ct0)?);
-
-        let cookie_value = format!("auth_token={}; ct0={}", auth_token, ct0);
-        headers.insert(COOKIE, HeaderValue::from_str(&cookie_value)?);
-
-        let http = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .default_headers(headers)
-            .min_tls_version(reqwest::tls::Version::TLS_1_2)
-            .https_only(true)
-            .build()?;
-
+    /// Load the stored token; fails with a "run `twit auth`" hint if there is none.
+    pub fn new(
+        client_id: String,
+        client_secret: Option<String>,
+        redirect_uri: String,
+    ) -> Result<Self> {
         Ok(Self {
-            http,
-            auth_token,
-            ct0,
+            http: build_http()?,
+            app: OAuthApp {
+                client_id,
+                client_secret,
+                redirect_uri,
+            },
+            token: Mutex::new(Token::load()?),
         })
     }
 
-    /// Generate X-Client-Transaction-Id header (required by Twitter)
-    fn generate_transaction_id(method: &str, path: &str) -> Result<String> {
-        let method = method.to_string();
-        let path = path.to_string();
+    /// Current access token; refreshes (and persists) it when forced or about to expire.
+    async fn access_token(&self, force_refresh: bool) -> Result<String> {
+        let mut token = self.token.lock().await;
+        if force_refresh || token.expires_within(60) {
+            auth::refresh(&self.http, &self.app, &mut token)
+                .await
+                .map_err(|e| {
+                    logging::log_error("twitter_auth", &format!("Refresh failed: {e:#}"));
+                    anyhow::anyhow!("Token refresh failed ({e}). Run `twit auth` to sign in again.")
+                })?;
+            token.save()?;
+        }
+        Ok(token.access_token.clone())
+    }
 
-        // Must run in blocking context since x-client-transaction uses blocking reqwest
-        tokio::task::block_in_place(|| {
-            let blocking_client = reqwest::blocking::Client::builder()
-                .user_agent(USER_AGENT)
-                .min_tls_version(reqwest::tls::Version::TLS_1_2)
-                .build()?;
+    async fn user_id(&self) -> String {
+        self.token.lock().await.user_id.clone()
+    }
 
-            let ct = ClientTransaction::new(&blocking_client)
-                .context("Failed to create ClientTransaction")?;
-
-            ct.generate_transaction_id(&method, &path)
-                .context("Failed to generate transaction ID")
-        })
+    /// Authenticated API call; refreshes once and retries on 401.
+    async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<Value>,
+    ) -> Result<Value> {
+        let mut retried = false;
+        loop {
+            let access = self.access_token(retried).await?;
+            let mut req = self
+                .http
+                .request(method.clone(), format!("{API_BASE}{path}"))
+                .bearer_auth(access)
+                .query(query);
+            if let Some(body) = &body {
+                req = req.json(body);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED && !retried {
+                retried = true;
+                continue;
+            }
+            if status.is_success() {
+                return resp.json().await.context("Failed to parse JSON response");
+            }
+            let reset = resp
+                .headers()
+                .get("x-rate-limit-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<i64>().ok())
+                .and_then(|ts| DateTime::from_timestamp(ts, 0))
+                .map(|t| t.with_timezone(&Local).format("%H:%M:%S").to_string());
+            let text = resp.text().await.unwrap_or_default();
+            logging::log_error("twitter_api", &format!("{path} status {status}: {text}"));
+            if status.as_u16() == 429 {
+                anyhow::bail!(
+                    "X API rate limit hit (HTTP 429); resets at {}",
+                    reset.as_deref().unwrap_or("unknown time")
+                );
+            }
+            let err: Value = serde_json::from_str(&text).unwrap_or_default();
+            let detail = [str_at(&err, "title"), str_at(&err, "detail")]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(": ");
+            if detail.is_empty() {
+                anyhow::bail!("X API request failed (HTTP {})", status.as_u16());
+            }
+            anyhow::bail!("X API error (HTTP {}): {detail}", status.as_u16());
+        }
     }
 
     /// Fetch home timeline
     pub async fn get_home_timeline(&self, count: usize) -> Result<Vec<Tweet>> {
-        let page = self.get_home_timeline_page(count, None).await?;
-        Ok(page.tweets)
+        Ok(self.get_home_timeline_page(count, None).await?.tweets)
     }
 
-    /// Fetch home timeline page with optional cursor
+    /// Fetch home timeline page with optional cursor (pagination_token)
     pub async fn get_home_timeline_page(
         &self,
         count: usize,
         cursor: Option<&str>,
     ) -> Result<TimelinePage> {
         let body = self.fetch_timeline(count, cursor).await?;
-        self.parse_timeline_response(&body)
+        Ok(parse_timeline(&body))
     }
 
-    /// Fetch timeline and return raw JSON
     async fn fetch_timeline(&self, count: usize, cursor: Option<&str>) -> Result<Value> {
-        let transaction_id = Self::generate_transaction_id("GET", HOME_TIMELINE_PATH)?;
-        let url = build_timeline_url(count, cursor);
-
-        let response = self
-            .http
-            .get(&url)
-            .header("x-client-transaction-id", &transaction_id)
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            // Log full response for debugging, but don't expose to user
-            logging::log_error("twitter_api", &format!("Status {}: {}", status, body));
-            anyhow::bail!("Twitter API request failed (status: {})", status);
+        let me = self.user_id().await;
+        let mut query = vec![
+            ("max_results", count.clamp(1, 100).to_string()),
+            ("tweet.fields", TWEET_FIELDS.to_string()),
+            ("expansions", EXPANSIONS.to_string()),
+            ("user.fields", USER_FIELDS.to_string()),
+            ("media.fields", MEDIA_FIELDS.to_string()),
+        ];
+        if let Some(c) = cursor {
+            query.push(("pagination_token", c.to_string()));
         }
-
-        response
-            .json()
-            .await
-            .context("Failed to parse JSON response")
+        self.request(
+            Method::GET,
+            &format!("/2/users/{me}/timelines/reverse_chronological"),
+            &query,
+            None,
+        )
+        .await
     }
 
     /// Fetch raw home timeline JSON for debugging
@@ -247,402 +208,20 @@ impl TwitterClient {
         self.fetch_timeline(count, None).await
     }
 
-    /// Parse the GraphQL timeline response into Tweet structs
-    fn parse_timeline_response(&self, response: &Value) -> Result<TimelinePage> {
-        let mut tweets = Vec::new();
-        let mut next_cursor = None;
-
-        // HomeLatestTimeline uses: data.home.home_timeline_urt.instructions[].entries[]
-        // Try both possible paths
-        let instructions = response
-            .get("data")
-            .and_then(|d| {
-                // Try home.home_timeline_urt first (HomeLatestTimeline)
-                d.get("home")
-                    .and_then(|h| h.get("home_timeline_urt"))
-                    .and_then(|u| u.get("instructions"))
-                    // Fall back to viewer.home_timeline (older format)
-                    .or_else(|| {
-                        d.get("viewer")
-                            .and_then(|v| v.get("home_timeline"))
-                            .and_then(|h| h.get("timeline"))
-                            .and_then(|t| t.get("instructions"))
-                    })
-            })
-            .and_then(|i| i.as_array())
-            .context("Invalid timeline response structure")?;
-
-        for instruction in instructions {
-            if let Some(entries) = instruction.get("entries").and_then(|e| e.as_array()) {
-                for entry in entries {
-                    if let Some((cursor_type, cursor)) = self.parse_cursor(entry)
-                        && cursor_type == "Bottom"
-                    {
-                        next_cursor = Some(cursor);
-                    }
-
-                    // Filter out promoted content
-                    if !self.is_promoted(entry) {
-                        let parsed_tweets = self.parse_entry(entry);
-                        tweets.extend(parsed_tweets);
-                    }
-                }
-            }
-        }
-
-        Ok(TimelinePage {
-            tweets,
-            next_cursor,
-        })
-    }
-
-    fn parse_cursor(&self, entry: &Value) -> Option<(String, String)> {
-        let content = entry.get("content")?;
-        let typename = content.str_at("__typename");
-        if typename != "TimelineTimelineCursor" && typename != "TimelineCursor" {
-            return None;
-        }
-
-        let cursor_type = content
-            .get("cursorType")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| {
-                content
-                    .get("cursor_type")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })?;
-
-        let value = content
-            .get("value")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| {
-                content
-                    .get("operation")
-                    .and_then(|op| op.get("cursor"))
-                    .and_then(|c| c.get("value"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })?;
-
-        Some((cursor_type, value))
-    }
-
-    /// Check if an entry is promoted/ad content
-    fn is_promoted(&self, entry: &Value) -> bool {
-        let injection_type = entry
-            .get("content")
-            .and_then(|c| c.get("clientEventInfo"))
-            .and_then(|i| i.get("details"))
-            .and_then(|d| d.get("timelinesDetails"))
-            .and_then(|t| t.get("injectionType"))
-            .and_then(|i| i.as_str())
-            .unwrap_or("");
-
-        injection_type.contains("Promoted") || injection_type.contains("WhoToFollow")
-    }
-
-    /// Parse a single timeline entry into tweets (may return multiple for conversation threads)
-    fn parse_entry(&self, entry: &Value) -> Vec<Tweet> {
-        let Some(content) = entry.get("content") else {
-            return Vec::new();
-        };
-
-        match content.str_at("__typename") {
-            "TimelineTimelineItem" => self
-                .parse_item_content(content.get("itemContent"))
-                .into_iter()
-                .collect(),
-            "TimelineTimelineModule" => content
-                .get("items")
-                .and_then(|i| i.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|item| {
-                    let item_content = item.get("item").and_then(|i| i.get("itemContent"));
-                    self.parse_item_content(item_content)
-                })
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
-
-    /// Parse itemContent into a Tweet
-    fn parse_item_content(&self, item_content: Option<&Value>) -> Option<Tweet> {
-        let item_content = item_content?;
-
-        if item_content.str_at("__typename") != "TimelineTweet" {
-            return None;
-        }
-
-        let tweet_results = item_content.get("tweet_results")?.get("result")?;
-        self.parse_tweet_result(tweet_results)
-    }
-
-    /// Parse a tweet_results object
-    fn parse_tweet_result(&self, result: &Value) -> Option<Tweet> {
-        let typename = result.str_at("__typename");
-
-        // Skip unavailable tweets
-        if typename == "TweetUnavailable" || typename == "TweetTombstone" {
-            return None;
-        }
-
-        // Handle TweetWithVisibilityResults wrapper
-        let tweet_data = if typename == "TweetWithVisibilityResults" {
-            result.get("tweet")?
-        } else {
-            result
-        };
-
-        let legacy = tweet_data.get("legacy")?;
-        let core = tweet_data.get("core")?;
-        let user_results = core.get("user_results")?.get("result")?;
-
-        if user_results.str_at("__typename") == "UserUnavailable" {
-            return None;
-        }
-
-        let retweeter = self.parse_user(user_results);
-        let retweeted_status = legacy
-            .get("retweeted_status_result")
-            .and_then(|r| r.get("result"));
-        let (user, legacy, retweeted_by, is_retweet) = if let Some(retweeted) = retweeted_status {
-            let retweeted_tweet = if retweeted.str_at("__typename") == "TweetWithVisibilityResults"
-            {
-                retweeted.get("tweet")
-            } else {
-                Some(retweeted)
-            };
-            let retweeted_tweet = retweeted_tweet?;
-            let retweeted_legacy = retweeted_tweet.get("legacy")?;
-            let retweeted_core = retweeted_tweet.get("core")?;
-            let retweeted_user = retweeted_core.get("user_results")?.get("result")?;
-            if retweeted_user.str_at("__typename") == "UserUnavailable" {
-                return None;
-            }
-            (
-                self.parse_user(retweeted_user),
-                retweeted_legacy,
-                Some(retweeter.screen_name.clone()),
-                true,
-            )
-        } else {
-            (retweeter, legacy, None, false)
-        };
-
-        let quoted_tweet = tweet_data
-            .get("quoted_status_result")
-            .and_then(|q| q.get("result"))
-            .and_then(|r| self.parse_tweet_result(r))
-            .map(Box::new);
-
-        let created_at = legacy
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .and_then(|s| DateTime::parse_from_str(s, "%a %b %d %H:%M:%S %z %Y").ok())
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
-
-        let optional_str = |obj: &Value, key: &str| -> Option<String> {
-            obj.get(key)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-        };
-
-        let urls = legacy
-            .get("entities")
-            .and_then(|e| e.get("urls"))
-            .and_then(|u| u.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|u| {
-                        let expanded = u.get("expanded_url")?.as_str()?;
-                        Some(crate::twitter::UrlEntity {
-                            url: u.str_at("url").to_string(),
-                            expanded_url: expanded.to_string(),
-                            display_url: u.str_at("display_url").to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Some(Tweet {
-            id: tweet_data.str_at("rest_id").to_string(),
-            text: legacy.str_at("full_text").to_string(),
-            user,
-            created_at,
-            media: self.parse_media(legacy),
-            retweet_count: legacy.u64_at("retweet_count"),
-            like_count: legacy.u64_at("favorite_count"),
-            reply_count: legacy.u64_at("reply_count"),
-            bookmark_count: legacy.u64_at("bookmark_count"),
-            quote_count: legacy.u64_at("quote_count"),
-            is_retweet,
-            retweeted_by,
-            is_quote: quoted_tweet.is_some(),
-            quoted_tweet,
-            conversation_id: optional_str(legacy, "conversation_id_str"),
-            in_reply_to_status_id: optional_str(legacy, "in_reply_to_status_id_str"),
-            in_reply_to_screen_name: optional_str(legacy, "in_reply_to_screen_name"),
-            lang: optional_str(legacy, "lang"),
-            urls,
-        })
-    }
-
-    /// Parse user data from user_results
-    fn parse_user(&self, user_results: &Value) -> User {
-        let user_core = user_results.get("core");
-        let user_legacy = user_results.get("legacy");
-
-        // Helper to get string from core with legacy fallback
-        let get_str = |key: &str, legacy_key: &str| -> String {
-            user_core
-                .and_then(|c| c.get(key))
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    user_legacy
-                        .and_then(|l| l.get(legacy_key))
-                        .and_then(|v| v.as_str())
-                })
-                .unwrap_or("")
-                .to_string()
-        };
-
-        User {
-            id: user_results.str_at("rest_id").to_string(),
-            name: get_str("name", "name"),
-            screen_name: get_str("screen_name", "screen_name"),
-            profile_image_url: user_results
-                .get("avatar")
-                .and_then(|a| a.get("image_url"))
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    user_legacy
-                        .and_then(|l| l.get("profile_image_url_https"))
-                        .and_then(|v| v.as_str())
-                })
-                .unwrap_or("")
-                .to_string(),
-            verified: user_legacy.map(|l| l.bool_at("verified")).unwrap_or(false),
-            blue_verified: user_results.bool_at("is_blue_verified"),
-        }
-    }
-
-    /// Parse media from tweet legacy data
-    fn parse_media(&self, legacy: &Value) -> Vec<Media> {
-        legacy
-            .get("extended_entities")
-            .and_then(|e| e.get("media"))
-            .and_then(|m| m.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|item| self.parse_media_item(item))
-            .collect()
-    }
-
-    /// Parse a single media item
-    fn parse_media_item(&self, item: &Value) -> Option<Media> {
-        let media_type = match item.str_at("type") {
-            "photo" => MediaType::Photo,
-            "video" => MediaType::Video,
-            "animated_gif" => MediaType::Gif,
-            _ => return None,
-        };
-
-        let url = if media_type == MediaType::Photo {
-            item.str_at("media_url_https").to_string()
-        } else {
-            self.get_best_video_url(item)
-        };
-
-        let sizes = item.get("sizes").and_then(|s| s.get("large"));
-
-        Some(Media {
-            url,
-            media_type,
-            width: sizes.map(|s| s.u64_at("w") as u32).unwrap_or(0),
-            height: sizes.map(|s| s.u64_at("h") as u32).unwrap_or(0),
-            preview_url: (media_type != MediaType::Photo)
-                .then(|| item.str_at("media_url_https").to_string())
-                .filter(|s| !s.is_empty()),
-        })
-    }
-
-    /// Get highest quality MP4 video URL from media item
-    fn get_best_video_url(&self, item: &Value) -> String {
-        item.get("video_info")
-            .and_then(|vi| vi.get("variants"))
-            .and_then(|v| v.as_array())
-            .and_then(|variants| {
-                variants
-                    .iter()
-                    .filter(|v| v.str_at("content_type") == "video/mp4")
-                    .max_by_key(|v| v.u64_at("bitrate"))
-                    .map(|v| v.str_at("url"))
-            })
-            .unwrap_or("")
-            .to_string()
-    }
-
     /// Look up a user's ID by their screen name
     pub async fn get_user_id_by_screen_name(&self, screen_name: &str) -> Result<String> {
-        let variables = serde_json::json!({
-            "screen_name": screen_name,
-            "withSafetyModeUserFields": true
-        });
-        let features = serde_json::json!({
-            "hidden_profile_subscriptions_enabled": true,
-            "rweb_tipjar_consumption_enabled": true,
-            "responsive_web_graphql_exclude_directive_enabled": true,
-            "verified_phone_label_enabled": false,
-            "subscriptions_verification_info_is_identity_verified_enabled": true,
-            "subscriptions_verification_info_verified_since_enabled": true,
-            "highlights_tweets_tab_ui_enabled": true,
-            "responsive_web_twitter_article_notes_tab_enabled": true,
-            "subscriptions_feature_can_gift_premium": true,
-            "creator_subscriptions_tweet_preview_api_enabled": true,
-            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": false,
-            "responsive_web_graphql_timeline_navigation_enabled": true
-        });
-
-        let url = format!(
-            "https://x.com{}?variables={}&features={}",
-            USER_BY_SCREEN_NAME_PATH,
-            urlencoding::encode(&variables.to_string()),
-            urlencoding::encode(&features.to_string())
-        );
-
-        let transaction_id = Self::generate_transaction_id("GET", USER_BY_SCREEN_NAME_PATH)?;
-
-        let response = self
-            .http
-            .get(&url)
-            .header("x-client-transaction-id", &transaction_id)
-            .send()
+        let body = self
+            .request(
+                Method::GET,
+                &format!("/2/users/by/username/{}", urlencoding::encode(screen_name)),
+                &[],
+                None,
+            )
             .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            logging::log_error("twitter_api", &format!("User lookup {}: {}", status, body));
-            anyhow::bail!("User lookup failed (status: {})", status);
-        }
-
-        let body: Value = response.json().await?;
-        let user_id = body
-            .get("data")
-            .and_then(|d| d.get("user"))
-            .and_then(|u| u.get("result"))
-            .and_then(|r| r.get("rest_id"))
-            .and_then(|id| id.as_str())
-            .context("User not found or invalid response")?;
-
-        Ok(user_id.to_string())
+        body.pointer("/data/id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .context("User not found or invalid response")
     }
 
     /// Get a page of accounts that a user is following
@@ -651,189 +230,319 @@ impl TwitterClient {
         user_id: &str,
         cursor: Option<&str>,
     ) -> Result<FollowingPage> {
-        let mut variables = serde_json::json!({
-            "userId": user_id,
-            "count": 100,
-            "includePromotedContent": false
-        });
-        if let Some(cursor) = cursor {
-            variables["cursor"] = Value::String(cursor.to_string());
+        let mut query = vec![
+            ("max_results", "1000".to_string()),
+            ("user.fields", "name,username".to_string()),
+        ];
+        if let Some(c) = cursor {
+            query.push(("pagination_token", c.to_string()));
         }
-
-        let features = serde_json::json!({
-            "rweb_tipjar_consumption_enabled": true,
-            "responsive_web_graphql_exclude_directive_enabled": true,
-            "verified_phone_label_enabled": false,
-            "creator_subscriptions_tweet_preview_api_enabled": true,
-            "responsive_web_graphql_timeline_navigation_enabled": true,
-            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": false,
-            "communities_web_enable_tweet_community_results_fetch": true,
-            "c9s_tweet_anatomy_moderator_badge_enabled": true,
-            "articles_preview_enabled": true,
-            "responsive_web_edit_tweet_api_enabled": true,
-            "graphql_is_translatable_rweb_tweet_is_translatable_enabled": true,
-            "view_counts_everywhere_api_enabled": true,
-            "longform_notetweets_consumption_enabled": true,
-            "responsive_web_twitter_article_tweet_consumption_enabled": true,
-            "tweet_awards_web_tipping_enabled": false,
-            "creator_subscriptions_quote_tweet_preview_enabled": false,
-            "freedom_of_speech_not_reach_fetch_enabled": true,
-            "standardized_nudges_misinfo": true,
-            "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": true,
-            "rweb_video_timestamps_enabled": true,
-            "longform_notetweets_rich_text_read_enabled": true,
-            "longform_notetweets_inline_media_enabled": true,
-            "responsive_web_enhance_cards_enabled": false
-        });
-
-        let url = format!(
-            "https://x.com{}?variables={}&features={}",
-            FOLLOWING_PATH,
-            urlencoding::encode(&variables.to_string()),
-            urlencoding::encode(&features.to_string())
-        );
-
-        let transaction_id = Self::generate_transaction_id("GET", FOLLOWING_PATH)?;
-
-        let response = self
-            .http
-            .get(&url)
-            .header("x-client-transaction-id", &transaction_id)
-            .send()
+        let body = self
+            .request(
+                Method::GET,
+                &format!("/2/users/{user_id}/following"),
+                &query,
+                None,
+            )
             .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            logging::log_error(
-                "twitter_api",
-                &format!("Following lookup {}: {}", status, body),
-            );
-            anyhow::bail!("Following lookup failed (status: {})", status);
-        }
-
-        let body: Value = response.json().await?;
-        self.parse_following_response(&body)
-    }
-
-    /// Parse following response into users and cursor
-    fn parse_following_response(&self, response: &Value) -> Result<FollowingPage> {
-        let mut users = Vec::new();
-        let mut next_cursor = None;
-
-        let instructions = response
+        let users = body
             .get("data")
-            .and_then(|d| d.get("user"))
-            .and_then(|u| u.get("result"))
-            .and_then(|r| r.get("timeline"))
-            .and_then(|t| t.get("timeline"))
-            .and_then(|t| t.get("instructions"))
-            .and_then(|i| i.as_array())
-            .context("Invalid following response structure")?;
-
-        for instruction in instructions {
-            let Some(entries) = instruction.get("entries").and_then(|e| e.as_array()) else {
-                continue;
-            };
-
-            for entry in entries {
-                // Check for cursor
-                let entry_id = entry.str_at("entryId");
-                if entry_id.starts_with("cursor-bottom") {
-                    if let Some(cursor) = entry
-                        .get("content")
-                        .and_then(|c| c.get("value"))
-                        .and_then(|v| v.as_str())
-                    {
-                        next_cursor = Some(cursor.to_string());
-                    }
-                    continue;
-                }
-
-                // Parse user entry
-                if !entry_id.starts_with("user-") {
-                    continue;
-                }
-                if let Some(user) = self.parse_following_entry(entry) {
-                    users.push(user);
-                }
-            }
-        }
-
-        Ok(FollowingPage { users, next_cursor })
-    }
-
-    /// Parse a single user entry from following response
-    fn parse_following_entry(&self, entry: &Value) -> Option<FollowingUser> {
-        let user_results = entry
-            .get("content")
-            .and_then(|c| c.get("itemContent"))
-            .and_then(|i| i.get("user_results"))
-            .and_then(|u| u.get("result"))?;
-
-        if user_results.str_at("__typename") == "UserUnavailable" {
-            return None;
-        }
-
-        let rest_id = user_results.str_at("rest_id").to_string();
-        if rest_id.is_empty() {
-            return None;
-        }
-
-        let legacy = user_results.get("legacy")?;
-
-        Some(FollowingUser {
-            id: rest_id,
-            screen_name: legacy.str_at("screen_name").to_string(),
-            name: legacy.str_at("name").to_string(),
-            following: legacy.bool_at("following"),
+            .and_then(|d| d.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|u| FollowingUser {
+                        id: str_at(u, "id").to_string(),
+                        screen_name: str_at(u, "username").to_string(),
+                        name: str_at(u, "name").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(FollowingPage {
+            users,
+            next_cursor: next_token(&body),
         })
     }
 
     /// Follow a user by their ID
     pub async fn follow_user(&self, user_id: &str) -> Result<()> {
-        let transaction_id = Self::generate_transaction_id("POST", CREATE_FRIENDSHIP_PATH)?;
-
-        let url = format!("https://x.com{}", CREATE_FRIENDSHIP_PATH);
-
-        let response = self
-            .http
-            .post(&url)
-            .header("x-client-transaction-id", &transaction_id)
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(format!(
-                "include_profile_interstitial_type=1&skip_status=true&user_id={}",
-                user_id
-            ))
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            logging::log_error(
-                "twitter_api",
-                &format!("Follow action {}: {}", status, body),
-            );
-            anyhow::bail!("Follow action failed (status: {})", status);
-        }
-
-        Ok(())
+        let me = self.user_id().await;
+        self.request(
+            Method::POST,
+            &format!("/2/users/{me}/following"),
+            &[],
+            Some(serde_json::json!({ "target_user_id": user_id })),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
-/// A user from the following list
-#[derive(Debug, Clone)]
-pub struct FollowingUser {
-    pub id: String,
-    pub screen_name: String,
-    pub name: String,
-    pub following: bool,
+// ---- v2 response mapping -------------------------------------------------
+
+fn str_at<'a>(v: &'a Value, key: &str) -> &'a str {
+    v.get(key).and_then(|v| v.as_str()).unwrap_or("")
 }
 
-/// A page of following results
-#[derive(Debug)]
-pub struct FollowingPage {
-    pub users: Vec<FollowingUser>,
-    pub next_cursor: Option<String>,
+fn u64_at(v: &Value, key: &str) -> u64 {
+    v.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+fn next_token(body: &Value) -> Option<String> {
+    body.pointer("/meta/next_token")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+/// `includes.<kind>` indexed by `id_key`.
+fn index<'a>(body: &'a Value, kind: &str, id_key: &str) -> HashMap<&'a str, &'a Value> {
+    body.pointer(&format!("/includes/{kind}"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|x| (str_at(x, id_key), x)).collect())
+        .unwrap_or_default()
+}
+
+struct Includes<'a> {
+    users: HashMap<&'a str, &'a Value>,
+    tweets: HashMap<&'a str, &'a Value>,
+    media: HashMap<&'a str, &'a Value>,
+}
+
+fn parse_timeline(body: &Value) -> TimelinePage {
+    let inc = Includes {
+        users: index(body, "users", "id"),
+        tweets: index(body, "tweets", "id"),
+        media: index(body, "media", "media_key"),
+    };
+    let tweets = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|a| a.iter().filter_map(|t| map_tweet(t, &inc)).collect())
+        .unwrap_or_default();
+    TimelinePage {
+        tweets,
+        next_cursor: next_token(body),
+    }
+}
+
+fn map_user(u: &Value) -> User {
+    User {
+        id: str_at(u, "id").to_string(),
+        name: str_at(u, "name").to_string(),
+        screen_name: str_at(u, "username").to_string(),
+        profile_image_url: str_at(u, "profile_image_url").to_string(),
+        verified: u.get("verified").and_then(|v| v.as_bool()).unwrap_or(false),
+        blue_verified: str_at(u, "verified_type") == "blue",
+    }
+}
+
+fn map_media(m: &Value) -> Option<Media> {
+    let kind = str_at(m, "type");
+    let preview = Some(str_at(m, "preview_image_url"))
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let (media_type, url) = match kind {
+        "photo" => (MediaType::Photo, str_at(m, "url").to_string()),
+        "video" | "animated_gif" => {
+            let best = m
+                .get("variants")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter(|v| str_at(v, "content_type") == "video/mp4")
+                .max_by_key(|v| u64_at(v, "bit_rate"))
+                .map(|v| str_at(v, "url").to_string())
+                .filter(|u| !u.is_empty());
+            let media_type = if kind == "video" {
+                MediaType::Video
+            } else {
+                MediaType::Gif
+            };
+            (media_type, best.or_else(|| preview.clone())?)
+        }
+        _ => return None,
+    };
+    if url.is_empty() {
+        return None;
+    }
+    Some(Media {
+        url,
+        media_type,
+        width: u64_at(m, "width") as u32,
+        height: u64_at(m, "height") as u32,
+        preview_url: preview.filter(|_| media_type != MediaType::Photo),
+    })
+}
+
+/// Map one v2 tweet object; `None` when the author or id is missing from the response.
+fn map_tweet(t: &Value, inc: &Includes) -> Option<Tweet> {
+    let id = Some(str_at(t, "id")).filter(|s| !s.is_empty())?;
+    let author = map_user(inc.users.get(str_at(t, "author_id"))?);
+
+    let refs: HashMap<&str, &str> = t
+        .get("referenced_tweets")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .map(|r| (str_at(r, "type"), str_at(r, "id")))
+        .collect();
+    let referenced = |kind: &str| {
+        refs.get(kind)
+            .and_then(|rid| inc.tweets.get(rid))
+            .and_then(|r| map_tweet(r, inc))
+    };
+
+    // Retweet: show the original, remember who retweeted it. Fall back to the wrapper if it is missing.
+    if let Some(mut original) = referenced("retweeted") {
+        original.id = id.to_string();
+        original.is_retweet = true;
+        original.retweeted_by = Some(author.screen_name);
+        return Some(original);
+    }
+
+    let note = t.get("note_tweet").filter(|n| n.get("text").is_some());
+    let text = note
+        .map_or_else(|| str_at(t, "text"), |n| str_at(n, "text"))
+        .to_string();
+    let entities = note
+        .and_then(|n| n.get("entities"))
+        .or_else(|| t.get("entities"));
+    let urls = entities
+        .and_then(|e| e.get("urls"))
+        .and_then(|u| u.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|u| !str_at(u, "expanded_url").is_empty())
+        .map(|u| UrlEntity {
+            url: str_at(u, "url").to_string(),
+            expanded_url: str_at(u, "expanded_url").to_string(),
+            display_url: str_at(u, "display_url").to_string(),
+        })
+        .collect();
+    let media = t
+        .pointer("/attachments/media_keys")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|k| k.as_str())
+        .filter_map(|k| inc.media.get(k))
+        .filter_map(|m| map_media(m))
+        .collect();
+    let metrics = t.get("public_metrics").unwrap_or(&Value::Null);
+    let quoted_tweet = referenced("quoted").map(Box::new);
+    let opt = |key: &str| {
+        Some(str_at(t, key))
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+
+    Some(Tweet {
+        id: id.to_string(),
+        text,
+        user: author,
+        created_at: DateTime::parse_from_rfc3339(str_at(t, "created_at"))
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        media,
+        retweet_count: u64_at(metrics, "retweet_count"),
+        like_count: u64_at(metrics, "like_count"),
+        reply_count: u64_at(metrics, "reply_count"),
+        bookmark_count: u64_at(metrics, "bookmark_count"),
+        quote_count: u64_at(metrics, "quote_count"),
+        is_retweet: false,
+        retweeted_by: None,
+        is_quote: quoted_tweet.is_some(),
+        quoted_tweet,
+        conversation_id: opt("conversation_id"),
+        in_reply_to_status_id: refs.get("replied_to").map(|s| s.to_string()),
+        in_reply_to_screen_name: inc
+            .users
+            .get(str_at(t, "in_reply_to_user_id"))
+            .map(|u| str_at(u, "username").to_string()),
+        lang: opt("lang"),
+        urls,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIXTURE: &str = r#"{
+      "data": [
+        {"id":"1","author_id":"u1","text":"short","created_at":"2025-01-02T03:04:05.000Z","lang":"en",
+         "conversation_id":"1","public_metrics":{"retweet_count":2,"like_count":3,"reply_count":4,"quote_count":5},
+         "note_tweet":{"text":"the long form text"},
+         "attachments":{"media_keys":["m1","m2"]},
+         "entities":{"urls":[{"url":"https://t.co/a","expanded_url":"https://example.com/a","display_url":"example.com/a"}]}},
+        {"id":"2","author_id":"u2","text":"RT @u3: orig","created_at":"2025-01-02T04:00:00.000Z",
+         "referenced_tweets":[{"type":"retweeted","id":"3"}]},
+        {"id":"6","author_id":"u1","text":"@u2 replying","created_at":"2025-01-02T05:00:00.000Z",
+         "in_reply_to_user_id":"u2","referenced_tweets":[{"type":"replied_to","id":"7"}]}
+      ],
+      "includes": {
+        "users": [
+          {"id":"u1","name":"One","username":"one","verified":false,"verified_type":"blue"},
+          {"id":"u2","name":"Two","username":"two"},
+          {"id":"u3","name":"Three","username":"three"},
+          {"id":"u4","name":"Four","username":"four"}
+        ],
+        "tweets": [
+          {"id":"3","author_id":"u3","text":"orig","created_at":"2025-01-01T00:00:00.000Z",
+           "referenced_tweets":[{"type":"quoted","id":"4"}]},
+          {"id":"4","author_id":"u4","text":"quoted body","created_at":"2024-12-31T00:00:00.000Z"}
+        ],
+        "media": [
+          {"media_key":"m1","type":"photo","url":"https://pbs.twimg.com/media/x.jpg","width":100,"height":50},
+          {"media_key":"m2","type":"video","preview_image_url":"https://pbs.twimg.com/p.jpg","variants":[
+            {"content_type":"application/x-mpegURL","url":"https://v/x.m3u8"},
+            {"content_type":"video/mp4","bit_rate":320000,"url":"https://v/lo.mp4"},
+            {"content_type":"video/mp4","bit_rate":2176000,"url":"https://v/hi.mp4"}]}
+        ]
+      },
+      "meta": {"next_token":"abc"}
+    }"#;
+
+    #[test]
+    fn maps_v2_timeline() {
+        let page = parse_timeline(&serde_json::from_str(FIXTURE).unwrap());
+        assert_eq!(page.next_cursor.as_deref(), Some("abc"));
+        assert_eq!(page.tweets.len(), 3);
+
+        let a = &page.tweets[0];
+        assert_eq!(a.text, "the long form text");
+        assert_eq!(
+            (
+                a.retweet_count,
+                a.like_count,
+                a.reply_count,
+                a.quote_count,
+                a.bookmark_count
+            ),
+            (2, 3, 4, 5, 0)
+        );
+        assert!(a.user.blue_verified && !a.user.verified);
+        assert_eq!(a.urls[0].expanded_url, "https://example.com/a");
+        assert_eq!(a.media.len(), 2);
+        assert_eq!(a.media[0].media_type, MediaType::Photo);
+        assert_eq!(a.media[0].url, "https://pbs.twimg.com/media/x.jpg");
+        assert_eq!(a.media[1].media_type, MediaType::Video);
+        assert_eq!(a.media[1].url, "https://v/hi.mp4");
+        assert_eq!(
+            a.media[1].preview_url.as_deref(),
+            Some("https://pbs.twimg.com/p.jpg")
+        );
+
+        let rt = &page.tweets[1];
+        assert!(rt.is_retweet);
+        assert_eq!(rt.retweeted_by.as_deref(), Some("two"));
+        assert_eq!(rt.user.screen_name, "three");
+        assert_eq!(rt.text, "orig");
+        assert!(rt.is_quote);
+        assert_eq!(rt.quoted_tweet.as_ref().unwrap().text, "quoted body");
+
+        let reply = &page.tweets[2];
+        assert_eq!(reply.in_reply_to_status_id.as_deref(), Some("7"));
+        assert_eq!(reply.in_reply_to_screen_name.as_deref(), Some("two"));
+    }
 }
